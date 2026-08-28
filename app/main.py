@@ -18,7 +18,8 @@ import time
 import uuid
 
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from schemas import (
@@ -33,8 +34,24 @@ from schemas import (
 )
 
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-0.5B-Instruct")
+API_KEY = os.environ.get("API_KEY", "")
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
+
+if not API_KEY:
+    print("WARNING: API_KEY is not set; /v1 endpoints are running unauthenticated")
 
 app = FastAPI(title="serving-stack", version="wk2")
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if request.url.path.startswith("/v1/") and API_KEY:
+        authorization = request.headers.get("Authorization", "")
+        if authorization != f"Bearer {API_KEY}":
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized"},
+            )
+
+    return await call_next(request)
 
 # Load once at import time. CPU only this week.
 print(f"loading {MODEL_ID} on cpu ...")
@@ -79,6 +96,7 @@ def list_models() -> ModelList:
 # ---------------------------------------------------------------------------
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
+    max_tokens = min(req.max_tokens, MAX_TOKENS)
     input_ids = tokenizer.apply_chat_template(
         [m.model_dump() for m in req.messages],
         add_generation_prompt=True,
@@ -90,7 +108,7 @@ def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
     with torch.no_grad():
         out = model.generate(
             input_ids,
-            max_new_tokens=req.max_tokens,
+            max_new_tokens=max_tokens,
             do_sample=req.temperature > 0,
             temperature=req.temperature if req.temperature > 0 else None,
         )
@@ -105,7 +123,7 @@ def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
 
     finish_reason = (
         "length"
-        if completion_tokens >= req.max_tokens
+        if completion_tokens >= max_tokens
         else "stop"
     )
 
